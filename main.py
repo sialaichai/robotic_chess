@@ -8,70 +8,94 @@ import chess
 import chess.engine
 from arm import ChessRobotArm
 
-# --- CONFIG ---
+# ==================================================================================
+# MASTER LOGIC CONTROLLER (main.py)
+# ----------------------------------------------------------------------------------
+# This script is the "Brain" of the project.
+# 1. Computer Vision: Detects moves by comparing camera frames.
+# 2. Chess Engine: Runs Stockfish to generate AI moves.
+# 3. Coordinate Mapping: Translates "e4" -> (10cm, 20cm) using calibration data.
+# ==================================================================================
+
+# --- CONFIGURATION ---
 ROBOT_CALIB = "calibration.json"
 VISION_CALIB = "sqdict.json"
-OVERRIDES_FILE = "overrides.json"
+OVERRIDES_FILE = "overrides.json" # Stores manual "Pin" adjustments
 STOCKFISH_PATH = r"stockfish/stockfish-windows-2022-x86-64-avx2.exe"
-CAMERA_INDEX = 0 
+CAMERA_INDEX = 0 # 0=Default Webcam. Change to 1 if using external cam.
 
-# --- ROBOT MATH HELPERS ---
+# --- HELPERS ---
+
 def get_xy_from_angles(b, s, e, w):
-    """Calculates Gripper Tip X,Y from angles (Forward Kinematics)."""
-    # MUST MATCH arm.py DIMENSIONS
+    """
+    Forward Kinematics: Calculates where the gripper IS based on servo angles.
+    Used during calibration to "Record" positions.
+    """
     L1 = 7.0; L2 = 17.7; L3 = 19.5; L4 = 17.0
     
+    # Convert everything to radians for Python math
     rad_b = math.radians(b) 
     rad_s = math.radians(s)
     
-    # Global Angles
+    # Calculate Global Angles (relative to horizon)
     global_e = s - (180 - e)
     rad_e = math.radians(global_e)
     global_w = global_e - w
     rad_w = math.radians(global_w)
 
-    # Horizontal Reach
+    # Sum the horizontal reach of all links
     r = (L2 * math.cos(rad_s)) + (L3 * math.cos(rad_e)) + (L4 * math.cos(rad_w))
     
-    # Cartesian Coords
+    # Convert Polar (R, Angle) to Cartesian (X, Y)
     x = r * math.cos(rad_b)
     y = r * math.sin(rad_b)
     return x, y
 
 class BoardMapper:
+    """
+    Handles the translation between Chess Logic (e.g., 'e4') and Robot Physics (cm).
+    """
     def __init__(self, cal_data):
+        # Load the "Anchors" (A1 and H8) from calibration
         self.a1 = cal_data['a1']
         self.h8 = cal_data['h8']
+        
+        # Calculate grid spacing
         self.x_step = (self.h8[0] - self.a1[0]) / 7.0
         self.y_step = (self.h8[1] - self.a1[1]) / 7.0
         
-        # Load Overrides (Point-to-Point Pins)
+        # Load Manual Overrides (Point-to-Point corrections)
         self.overrides = {}
         if os.path.exists(OVERRIDES_FILE):
             with open(OVERRIDES_FILE, 'r') as f:
                 self.overrides = json.load(f)
         
     def get_coords(self, square_name):
-        # 1. CHECK OVERRIDE
+        # 1. CHECK OVERRIDE FIRST
+        # If user manually pinned this square, ignore math and use saved point.
         if square_name in self.overrides:
-            print(f"[MAP] Using Override for {square_name}")
+            print(f"[MAP] Using Manual Override for {square_name}")
             return self.overrides[square_name]
 
-        # 2. USE MATH
-        col = ord(square_name[0]) - ord('a')
-        row = int(square_name[1]) - 1
+        # 2. FALLBACK TO GRID MATH
+        col = ord(square_name[0]) - ord('a') # 'a'->0, 'b'->1...
+        row = int(square_name[1]) - 1        # '1'->0, '2'->1...
+        
         x = self.a1[0] + (col * self.x_step)
         y = self.a1[1] + (row * self.y_step)
         return x, y
 
 def manual_jog(robot, b, s, e, w, g):
-    # Terminal-based jog (Fallback if no GUI)
+    """
+    Simple CLI function to move the robot if GUI is not available.
+    """
     print("  [JOG] W/S:Shoulder, A/D:Base, I/K:Elbow, J/L:Wrist. 'save' to done.")
     step = 2
     while True:
         cmd = input("  Jog > ").strip().lower()
         if cmd == 'save': return b, s, e, w, g
         
+        # Basic key mapping
         if cmd == 'w': s += step
         if cmd == 's': s -= step
         if cmd == 'a': b += step
@@ -83,49 +107,69 @@ def manual_jog(robot, b, s, e, w, g):
         if cmd == 'o': g = 0
         if cmd == 'p': g = 180
         
+        # Safety Clamps
         s = max(0, min(145, s))
         e = max(0, min(180, e))
         w = max(0, min(180, w))
         robot.send_cmd(b, s, e, w, g)
 
-# --- VISION HELPERS ---
+# --- COMPUTER VISION LOGIC ---
+
 def interpolate_grid(tl, tr, br, bl):
+    """
+    Takes 4 clicked corners and calculates the location of all 64 squares.
+    Uses 'Perspective Transform' to handle angled camera views.
+    """
     dict_sq = {}
     files = "abcdefgh"
     ranks = "87654321" 
+    
     src_pts = np.array([tl, tr, br, bl], dtype="float32")
+    # Map to a logical 800x800 square
     dst_size = 800
     dst_pts = np.array([[0, 0], [dst_size, 0], [dst_size, dst_size], [0, dst_size]], dtype="float32")
+    
+    # Calculate the transformation matrix
     M = cv2.getPerspectiveTransform(dst_pts, src_pts)
     step = dst_size / 8.0
 
     for r_idx, rank in enumerate(ranks):     
         for f_idx, file in enumerate(files): 
+            # Define square in logical space
             x1, y1 = f_idx * step, r_idx * step
             x2, y2 = (f_idx + 1) * step, (r_idx + 1) * step
             corners_logical = np.array([[[x1, y1]], [[x2, y1]], [[x2, y2]], [[x1, y2]]], dtype="float32")
+            
+            # Transform back to camera space (Pixels)
             corners_camera = cv2.perspectiveTransform(corners_logical, M)
             poly = [[int(c[0][0]), int(c[0][1])] for c in corners_camera]
             dict_sq[file + rank] = poly
     return dict_sq
 
 def detect_move(frame1, frame2, zones):
+    """
+    Compares 'Before' and 'After' images to find which squares changed.
+    Returns list of square names sorted by change intensity.
+    """
     diff = cv2.absdiff(frame1, frame2)
     gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY)
+    _, thresh = cv2.threshold(gray, 40, 255, cv2.THRESH_BINARY) # Sensitivity = 40
     changed = []
     
     for sq_name, poly in zones.items():
         mask = np.zeros(thresh.shape, dtype=np.uint8)
         cv2.fillPoly(mask, [np.array(poly, dtype=np.int32)], 255)
+        # Count white pixels (motion) inside the square
         score = cv2.countNonZero(cv2.bitwise_and(thresh, thresh, mask=mask))
         if score > 150: changed.append((sq_name, score))
             
     changed.sort(key=lambda x: x[1], reverse=True)
     return [x[0] for x in changed]
 
-# --- MODES (Terminal Functions) ---
+# --- GAME MODES ---
+
 def mode_cam_calib():
+    """Allows user to click 4 corners to calibrate camera."""
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened(): return print("Camera not found.")
     
@@ -151,6 +195,7 @@ def mode_cam_calib():
         print("Camera Calibration Saved.")
 
 def mode_play_game(robot):
+    """Main Game Loop."""
     if not os.path.exists(ROBOT_CALIB) or not os.path.exists(VISION_CALIB):
         return print("Calibrate Robot AND Camera first.")
     
@@ -166,23 +211,25 @@ def mode_play_game(robot):
     print("Move piece -> Remove Hand -> Press SPACEBAR.")
     
     time.sleep(1)
-    ret, frame_base = cap.read()
+    ret, frame_base = cap.read() # Take initial snapshot
     
     while not board.is_game_over():
-        # HUMAN TURN
+        # --- HUMAN TURN ---
         print("\n[WHITE] Your Move...")
         while True:
             ret, frame = cap.read()
             vis = frame.copy()
+            # Draw Grid Overlay
             for sq, poly in v_zones.items():
                 cv2.polylines(vis, [np.array(poly, np.int32)], True, (0,255,0), 1)
             cv2.imshow("Game", vis)
             
-            if cv2.waitKey(1) == 32: # SPACE
-                print("Scanning...")
+            if cv2.waitKey(1) == 32: # SPACE KEY detected
+                print("Scanning for changes...")
                 changes = detect_move(frame_base, frame, v_zones)
-                print(f"Changes: {changes}")
+                print(f"Changes Detected: {changes}")
                 
+                # Infer move from changed squares
                 user_move = None
                 for m in board.legal_moves:
                     if chess.square_name(m.from_square) in changes and \
@@ -190,15 +237,21 @@ def mode_play_game(robot):
                         user_move = m; break
                 
                 if user_move:
-                    print(f"Detected: {user_move.uci()}")
+                    print(f"Confirmed Move: {user_move.uci()}")
                     board.push(user_move)
-                    frame_base = frame.copy()
+                    
+                    # Log Board State
+                    print("----------------")
+                    print(board)
+                    print("----------------")
+                    
+                    frame_base = frame.copy() # Update snapshot
                     break
                 else: print("Move unclear. Try again.")
 
         if board.is_game_over(): break
 
-        # ROBOT TURN
+        # --- ROBOT TURN ---
         print("[BLACK] Robot Thinking...")
         result = engine.play(board, chess.engine.Limit(time=0.8))
         print(f"Robot Plays: {result.move.uci()}")
@@ -208,12 +261,14 @@ def mode_play_game(robot):
         x1, y1 = r_mapper.get_coords(sq1)
         x2, y2 = r_mapper.get_coords(sq2)
         
+        # Handle Capture (Dump piece first)
         if board.is_capture(result.move):
             robot.release(); robot.move_to_xyz(x2, y2)
             time.sleep(0.5); robot.grasp()
-            robot.send_cmd(180, 90, 90, 90, 180) # Dump
+            robot.send_cmd(180, 90, 90, 90, 180) # Move to Bin (Left Side)
             time.sleep(1); robot.release()
 
+        # Perform the actual move
         robot.release(); robot.move_to_xyz(x1, y1)
         time.sleep(0.8); robot.grasp(); robot.move_to_xyz(x1, y1)
         time.sleep(0.5); robot.send_cmd(90, 110, 160, 45, 180) # Lift
@@ -222,18 +277,15 @@ def mode_play_game(robot):
         time.sleep(0.5); robot.home()
         
         board.push(result.move)
+        
+        # Log Board State
+        print("----------------")
+        print(board)
+        print("----------------")
+        
+        # Wait for robot to clear out before taking snapshot
         time.sleep(1.5)
         ret, frame_base = cap.read()
 
     print("Game Over")
     cap.release(); cv2.destroyAllWindows(); engine.quit()
-
-if __name__ == "__main__":
-    # If run directly, show menu. Usually run via GUI though.
-    robot = ChessRobotArm(port='COM8')
-    while True:
-        print("\n1. Cam Calib  2. Play Game  3. Exit")
-        c = input("> ")
-        if c=='1': mode_cam_calib()
-        elif c=='2': mode_play_game(robot)
-        elif c=='3': break
