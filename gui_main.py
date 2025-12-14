@@ -5,306 +5,187 @@ import os
 import time
 import threading
 import math
-from arm import ChessRobotArm
+from arm import ChessRobotArm, Z_TRAVEL, Z_GRIP
 import main as master_script 
-
-# ==================================================================================
-# GUI CONTROLLER (gui_main.py)
-# ----------------------------------------------------------------------------------
-# This provides a User Interface using Tkinter.
-# It replaces command-line inputs with buttons and sliders.
-# It uses Threading to run heavy tasks (like the game loop) without freezing the window.
-# ==================================================================================
 
 # --- CONFIG ---
 ROBOT_CALIB = "calibration.json"
 OVERRIDES_FILE = "overrides.json"
 
-# --- HELPER: Redundant Forward Kinematics for Jogging Logic ---
+# --- HELPER: Forward Kinematics (SYNCED WITH ARM.PY) ---
 def get_xy_from_angles(b, s, e, w):
     L1 = 7.0; L2 = 17.7; L3 = 19.5; L4 = 17.0
-    rad_b = math.radians(b)
-    rad_s = math.radians(s)
-    global_e = s - (180 - e)
-    rad_e = math.radians(global_e)
-    global_w = global_e - w
-    rad_w = math.radians(global_w)
-    r = (L2 * math.cos(rad_s)) + (L3 * math.cos(rad_e)) + (L4 * math.cos(rad_w))
-    x = r * math.cos(rad_b)
-    y = r * math.sin(rad_b)
-    return x, y
+    
+    # Base Offset REMOVED to match arm.py (Was 13.5, now 0)
+    # Shoulder Offset KEPT to match arm.py (Gravity compensation)
+    OFFSET_BASE = 0.0
+    OFFSET_SHOULDER = 4.0
+    
+    true_b = b + OFFSET_BASE
+    true_s = s + OFFSET_SHOULDER
+
+    rb, rs = math.radians(true_b), math.radians(true_s)
+    ge = true_s - (180 - e); re = math.radians(ge)
+    gw = ge - w; rw = math.radians(gw)
+    r = (L2*math.cos(rs))+(L3*math.cos(re))+(L4*math.cos(rw))
+    return r*math.cos(rb), r*math.sin(rb)
 
 class BoardMapper:
-    """Simplified Mapper for the GUI to lookup coordinates."""
     def __init__(self, cal_data):
-        self.a1 = cal_data['a1']
-        self.h8 = cal_data['h8']
+        self.a1 = cal_data['a1']; self.h8 = cal_data['h8']
         self.x_step = (self.h8[0] - self.a1[0]) / 7.0
         self.y_step = (self.h8[1] - self.a1[1]) / 7.0
-        
-        self.overrides = {}
+        self.ovr = {}
         if os.path.exists(OVERRIDES_FILE):
-            with open(OVERRIDES_FILE, 'r') as f:
-                self.overrides = json.load(f)
-        
-    def get_coords(self, square_name):
-        if square_name in self.overrides:
-            return self.overrides[square_name]
-        col = ord(square_name[0]) - ord('a')
-        row = int(square_name[1]) - 1
-        x = self.a1[0] + (col * self.x_step)
-        y = self.a1[1] + (row * self.y_step)
-        return x, y
+            with open(OVERRIDES_FILE,'r') as f: self.ovr = json.load(f)
+    def get_coords(self, sq):
+        if sq in self.ovr: return self.ovr[sq]
+        c = ord(sq[0])-ord('a'); r = int(sq[1])-1
+        return self.a1[0]+(c*self.x_step), self.a1[1]+(r*self.y_step)
 
 class RobotGUI:
     def __init__(self, root):
-        self.root = root
-        self.root.title("Chess Robot Control Panel")
-        self.root.geometry("600x850")
-        
-        # 1. SETUP UI ELEMENTS
+        self.root = root; self.root.geometry("600x850")
+        self.root.title("Chess Robot Control Panel v4.1 (Clean)")
         self.setup_ui()
-
-        # 2. INTERNAL STATE (Tracks current position)
-        # self.b = 90; self.s = 90; self.e = 180; self.w = 0; self.g = 0
-        # NEW
-        self.b = 90; self.s = 90; self.e = 180; self.w = 18; self.g = 45
-        self.calib_corners = []
+        
+        self.b=90; self.s=90; self.e=180; self.w=18; self.g=34 
+        self.calib_points = {} # Dict for safe storage
         self.last_target_xy = None
-
-        # 3. CONNECT TO ROBOT
+        
         try:
             self.robot = ChessRobotArm(port='COM8')
-            if self.robot.connected: self.log("Robot Connected (COM8)")
-            else: self.log("WARNING: Robot Serial Failed")
+            if self.robot.connected: self.log("Robot Connected")
         except Exception as e:
-            self.robot = None
-            self.log(f"Connection Error: {e}")
+            self.robot = None; self.log(str(e))
 
     def log(self, msg):
-        """Prints messages to the scrolling text box at the bottom."""
-        ts = time.strftime("%H:%M:%S")
-        self.txt_log.insert(tk.END, f"[{ts}] {msg}\n")
+        self.txt_log.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         self.txt_log.see(tk.END)
-        print(msg)
 
     def setup_ui(self):
-        # Create Tabs
         tabs = ttk.Notebook(self.root)
-        self.tab_jog = ttk.Frame(tabs)
-        self.tab_test = ttk.Frame(tabs)
-        self.tab_game = ttk.Frame(tabs)
-        
-        tabs.add(self.tab_jog, text='1. Jog & Calibrate')
-        tabs.add(self.tab_test, text='2. Test & Fix')
-        tabs.add(self.tab_game, text='3. Vision & Game')
+        self.t_jog = ttk.Frame(tabs); tabs.add(self.t_jog, text='1. Jog')
+        self.t_test = ttk.Frame(tabs); tabs.add(self.t_test, text='2. Test')
+        self.t_game = ttk.Frame(tabs); tabs.add(self.t_game, text='3. Game')
         tabs.pack(expand=1, fill="both")
-        
-        # --- TAB 1: JOG CONTROLS ---
-        frame_jog = ttk.LabelFrame(self.tab_jog, text="Manual Control")
-        frame_jog.pack(pady=10, padx=10, fill="x")
-        
-        self.step_var = tk.IntVar(value=2)
-        f_step = ttk.Frame(frame_jog); f_step.pack(pady=5)
-        ttk.Label(f_step, text="Step (deg):").pack(side="left")
-        tk.Scale(f_step, from_=1, to=10, orient="horizontal", variable=self.step_var).pack(side="left")
 
-        btn_frame = ttk.Frame(frame_jog); btn_frame.pack(pady=10)
+        # JOG
+        f_jog = ttk.LabelFrame(self.t_jog, text="Manual Control"); f_jog.pack(pady=10)
+        self.step = tk.IntVar(value=2)
+        tk.Scale(f_jog, from_=1, to=10, orient="horizontal", variable=self.step).pack()
         
-        # Grid Layout for Directional Buttons
-        ttk.Button(btn_frame, text="Shld UP (W)", width=12, command=lambda: self.jog('w')).grid(row=0, column=1)
-        ttk.Button(btn_frame, text="Base LEFT (A)", width=12, command=lambda: self.jog('a')).grid(row=1, column=0)
-        ttk.Button(btn_frame, text="Shld DOWN (S)", width=12, command=lambda: self.jog('s')).grid(row=1, column=1)
-        ttk.Button(btn_frame, text="Base RIGHT (D)", width=12, command=lambda: self.jog('d')).grid(row=1, column=2)
-        
-        ttk.Label(btn_frame, text="---").grid(row=2, column=1)
-        
-        ttk.Button(btn_frame, text="Elbow EXT (I)", width=12, command=lambda: self.jog('i')).grid(row=3, column=1)
-        ttk.Button(btn_frame, text="Wrist DOWN (J)", width=12, command=lambda: self.jog('j')).grid(row=4, column=0)
-        ttk.Button(btn_frame, text="Elbow BEND (K)", width=12, command=lambda: self.jog('k')).grid(row=4, column=1)
-        ttk.Button(btn_frame, text="Wrist UP (L)", width=12, command=lambda: self.jog('l')).grid(row=4, column=2)
-        
-        ttk.Button(btn_frame, text="OPEN (O)", width=12, command=lambda: self.jog('o')).grid(row=5, column=0)
-        ttk.Button(btn_frame, text="CLOSE (P)", width=12, command=lambda: self.jog('p')).grid(row=5, column=2)
+        btns = [('W (Shld Up)',0,1,'w'), ('A (Base L)',1,0,'a'), ('S (Shld Dn)',1,1,'s'), ('D (Base R)',1,2,'d'),
+                ('I (Elbow)',3,1,'i'), ('J (EXTEND)',4,0,'j'), ('K (Elbow)',4,1,'k'), ('L (CURL)',4,2,'l'),
+                ('Open',5,0,'o'), ('Close',5,2,'p')]
+        bf = ttk.Frame(f_jog); bf.pack(pady=10)
+        for t,r,c,k in btns: ttk.Button(bf, text=t, width=10, command=lambda k=k: self.jog(k)).grid(row=r, column=c, padx=2, pady=2)
 
-        f_cal = ttk.LabelFrame(self.tab_jog, text="Calibration")
-        f_cal.pack(pady=10, padx=10, fill="x")
-        ttk.Button(f_cal, text="[1] Reset", command=self.calib_reset).pack(fill="x", pady=2)
-        ttk.Button(f_cal, text="[2] Save A1", command=lambda: self.calib_save("A1")).pack(fill="x", pady=2)
-        ttk.Button(f_cal, text="[3] Save H8", command=lambda: self.calib_save("H8")).pack(fill="x", pady=2)
-        ttk.Button(f_cal, text="[4] Save File", command=self.calib_finish).pack(fill="x", pady=2)
+        f_cal = ttk.LabelFrame(self.t_jog, text="Calibration Actions"); f_cal.pack(pady=10, fill="x", padx=10)
+        ttk.Button(f_cal, text="[1] Reset", command=self.calib_reset).pack(fill="x")
+        ttk.Button(f_cal, text="[2] Save Position as A1", command=lambda: self.calib_save("a1")).pack(fill="x")
+        ttk.Button(f_cal, text="[3] Save Position as H8", command=lambda: self.calib_save("h8")).pack(fill="x")
+        ttk.Button(f_cal, text="[4] Save File", command=self.calib_finish).pack(fill="x")
 
-        # --- TAB 2: TESTING TOOLS ---
-        f_test = ttk.Frame(self.tab_test); f_test.pack(pady=10, padx=20)
+        # TEST
+        f_test = ttk.Frame(self.t_test); f_test.pack(pady=10)
+        self.ent_target = ttk.Entry(f_test); self.ent_target.pack()
+        ttk.Button(f_test, text="Go To Square", command=self.test_goto).pack(pady=5)
+        ttk.Button(f_test, text="Fix Grid (Shift)", command=self.test_fix).pack(fill="x")
+        ttk.Button(f_test, text="Override (Pin)", command=self.save_override).pack(fill="x")
+        ttk.Button(f_test, text="Reset Pin", command=self.del_override).pack(fill="x")
         
-        ttk.Label(f_test, text="-- SINGLE SQUARE TEST --", font=("Arial", 10, "bold")).pack(pady=5)
-        ttk.Label(f_test, text="Target Square:").pack()
-        self.ent_target = ttk.Entry(f_test, font=("Arial", 12)); self.ent_target.pack(pady=5)
-        ttk.Button(f_test, text="GO TO SQUARE", command=self.test_goto).pack(pady=5, fill="x")
-        
-        # Correction Tools
-        ttk.Label(f_test, text="-- CORRECTION TOOLS --", font=("Arial", 10, "bold")).pack(pady=10)
-        ttk.Button(f_test, text="FIX GRID (Shift Whole Board)", command=self.test_fix).pack(pady=2, fill="x")
-        ttk.Button(f_test, text="OVERRIDE SQUARE (Pin Point)", command=self.save_override).pack(pady=2, fill="x")
-        ttk.Button(f_test, text="RESET SQUARE (Remove Pin)", command=self.del_override).pack(pady=2, fill="x")
+        ttk.Label(f_test, text="-- SIMULATOR --", font="bold").pack(pady=10)
+        self.ent_move = ttk.Entry(f_test); self.ent_move.pack()
+        self.chk_cap = tk.BooleanVar()
+        ttk.Checkbutton(f_test, text="Capture?", variable=self.chk_cap).pack()
+        ttk.Button(f_test, text="Execute Move", command=self.run_move_test).pack(pady=5)
 
-        # Move Simulator
-        ttk.Separator(f_test).pack(fill='x', pady=15)
-        ttk.Label(f_test, text="-- MOVE SIMULATOR --", font=("Arial", 10, "bold")).pack(pady=5)
-        
-        f_sim = ttk.Frame(f_test); f_sim.pack(fill="x")
-        ttk.Label(f_sim, text="Move (e.g. e2e4):").pack(side="left")
-        self.ent_move = ttk.Entry(f_sim, width=10); self.ent_move.pack(side="left", padx=5)
-        
-        self.chk_capture_var = tk.BooleanVar()
-        ttk.Checkbutton(f_sim, text="Capture?", variable=self.chk_capture_var).pack(side="left", padx=5)
-        
-        ttk.Button(f_test, text="EXECUTE TEST MOVE", command=self.run_move_test).pack(pady=5, fill="x")
+        # GAME
+        f_gm = ttk.Frame(self.t_game); f_gm.pack(pady=10)
+        ttk.Button(f_gm, text="Calibrate Camera", command=lambda: threading.Thread(target=master_script.mode_cam_calib).start()).pack(pady=5)
+        ttk.Button(f_gm, text="Start Game Loop", command=lambda: threading.Thread(target=master_script.mode_play_game, args=(self.robot,)).start()).pack(pady=5)
+        self.txt_log = tk.Text(self.root, height=10); self.txt_log.pack(fill="both", padx=5, pady=5)
 
-        # --- TAB 3: GAME LAUNCHER ---
-        f_game = ttk.Frame(self.tab_game); f_game.pack(pady=20, padx=20)
-        ttk.Button(f_game, text="Calibrate Camera", command=self.run_cam).pack(pady=10, fill="x")
-        ttk.Button(f_game, text="START GAME", command=self.run_game).pack(pady=10, fill="x")
-        
-        # Log Output Area
-        self.txt_log = tk.Text(self.root, height=12, bg="#f0f0f0", font=("Consolas", 9))
-        self.txt_log.pack(padx=10, pady=5, fill="both", expand=True)
-
-    # --- JOGGING LOGIC ---
     def jog(self, k):
-        step = self.step_var.get()
-        # Key Mapping
-        if k=='w': self.s+=step
-        if k=='s': self.s-=step
-        if k=='a': self.b+=step
-        if k=='d': self.b-=step
-        if k=='i': self.e+=step
-        if k=='k': self.e-=step
-        if k=='j': self.w-=step
-        if k=='l': self.w+=step
-        if k=='o': self.g=0
+        s = self.step.get()
+        if k=='w': self.s+=s; 
+        if k=='s': self.s-=s
+        if k=='a': self.b+=s; 
+        if k=='d': self.b-=s
+        if k=='i': self.e+=s; 
+        if k=='k': self.e-=s
+        if k=='j': self.w-=s; 
+        if k=='l': self.w+=s
+        if k=='o': self.g=34; 
         if k=='p': self.g=180
-        
-        # Safety Clamps
-        self.s = max(0, min(145, self.s))
-        self.e = max(0, min(180, self.e))
-        self.w = max(0, min(180, self.w))
+        self.s = max(0, min(145, self.s)); self.e = max(0, min(180, self.e)); self.w = max(0, min(180, self.w))
         if self.robot: self.robot.send_cmd(self.b, self.s, self.e, self.w, self.g)
-        self.log(f"Jog: {self.b} {self.s} {self.e} {self.w}")
+        self.log(f"J: {self.b} {self.s} {self.e} {self.w}")
 
-    # --- CALIBRATION LOGIC ---
-    def calib_reset(self):
-        self.calib_corners = []
-        #self.b=90; self.s=90; self.e=180; self.w=0
-        # NEW:
-        self.b=90; self.s=90; self.e=180; self.w=18; self.g=45
+    def calib_reset(self): 
+        self.calib_points={}; self.b=90; self.s=90; self.e=180; self.w=18; self.g=34
         if self.robot: self.robot.home()
-        self.log("Reset Done.")
+        self.log("Reset.")
 
-    def calib_save(self, name):
-        x, y = get_xy_from_angles(self.b, self.s, self.e, self.w)
-        self.calib_corners.append((x,y))
-        self.log(f"Captured {name}: {x:.1f}, {y:.1f}")
+    def calib_save(self, name): 
+        self.calib_points[name] = get_xy_from_angles(self.b,self.s,self.e,self.w)
+        self.log(f"Saved {name.upper()}")
 
-    def calib_finish(self):
-        if len(self.calib_corners)<2: return self.log("Need 2 pts.")
-        data = {"a1": self.calib_corners[-2], "h8": self.calib_corners[-1]}
-        with open(ROBOT_CALIB, "w") as f: json.dump(data, f)
-        self.log("Calibration Saved.")
-
-    # --- TESTING LOGIC ---
+    def calib_finish(self): 
+        if "a1" not in self.calib_points or "h8" not in self.calib_points: return self.log("Error: Need A1 & H8.")
+        json.dump({"a1":self.calib_points["a1"],"h8":self.calib_points["h8"]}, open(ROBOT_CALIB,'w'))
+        self.log("Saved Calib.")
+    
     def test_goto(self):
-        sq = self.ent_target.get().lower()
-        if not os.path.exists(ROBOT_CALIB): return self.log("No Calib File.")
-        with open(ROBOT_CALIB,'r') as f: mapper = BoardMapper(json.load(f))
-        try:
-            tx, ty = mapper.get_coords(sq)
-            self.last_target_xy = (tx, ty)
-            self.log(f"Going to {sq}...")
-            self.robot.gripper_state = 180
-            self.robot.home()
-            time.sleep(0.5)
-            self.robot.move_to_xyz(tx, ty)
-            sol = self.robot.inverse_kinematics(tx, ty)
-            if sol: self.b, self.s, self.e, self.w = sol; self.g=180
-        except Exception as e: self.log(str(e))
-
+        sq = self.ent_target.get()
+        if not os.path.exists(ROBOT_CALIB): return self.log("No Calib.")
+        mapper = BoardMapper(json.load(open(ROBOT_CALIB)))
+        x, y = mapper.get_coords(sq)
+        self.last_target_xy = (x,y)
+        self.robot.gripper_state = 180
+        self.robot.move_to_xyz(x, y, z=Z_TRAVEL); time.sleep(0.5); self.robot.move_to_xyz(x, y, z=Z_GRIP)
+        angles = self.robot.inverse_kinematics(x, y, z_height=Z_GRIP)
+        if angles: self.b, self.s, self.e, self.w = angles; self.g = 180; self.log(f"Arrived {sq}. Synced.")
+    
     def test_fix(self):
-        # Shifts the ENTIRE grid
-        if not self.last_target_xy: return self.log("No previous move.")
+        if not self.last_target_xy: return
         rx, ry = get_xy_from_angles(self.b, self.s, self.e, self.w)
-        tx, ty = self.last_target_xy
-        dx, dy = rx-tx, ry-ty
-        with open(ROBOT_CALIB,'r') as f: data = json.load(f)
-        data['a1'] = (data['a1'][0]+dx, data['a1'][1]+dy)
-        data['h8'] = (data['h8'][0]+dx, data['h8'][1]+dy)
-        with open(ROBOT_CALIB,'w') as f: json.dump(data, f)
-        self.log(f"Grid Shifted: X{dx:.2f} Y{dy:.2f}")
+        dx, dy = rx-self.last_target_xy[0], ry-self.last_target_xy[1]
+        d = json.load(open(ROBOT_CALIB))
+        d['a1'] = [d['a1'][0]+dx, d['a1'][1]+dy]; d['h8'] = [d['h8'][0]+dx, d['h8'][1]+dy]
+        json.dump(d, open(ROBOT_CALIB,'w')); self.log("Fixed.")
 
     def save_override(self):
-        # Pins ONE square permanently
-        sq = self.ent_target.get().lower()
-        if not sq: return self.log("Enter Square Name.")
-        x, y = get_xy_from_angles(self.b, self.s, self.e, self.w)
-        ovr = {}
-        if os.path.exists(OVERRIDES_FILE):
-            with open(OVERRIDES_FILE,'r') as f: ovr = json.load(f)
-        ovr[sq] = (x, y)
-        with open(OVERRIDES_FILE,'w') as f: json.dump(ovr, f)
-        self.log(f"Pinned {sq} at {x:.1f},{y:.1f}")
+        sq = self.ent_target.get(); d = {}
+        if os.path.exists(OVERRIDES_FILE): d = json.load(open(OVERRIDES_FILE))
+        d[sq] = get_xy_from_angles(self.b, self.s, self.e, self.w)
+        json.dump(d, open(OVERRIDES_FILE,'w')); self.log(f"Pinned {sq}")
 
     def del_override(self):
-        # Removes a pin
-        sq = self.ent_target.get().lower()
-        if not os.path.exists(OVERRIDES_FILE): return
-        with open(OVERRIDES_FILE,'r') as f: ovr = json.load(f)
-        if sq in ovr:
-            del ovr[sq]
-            with open(OVERRIDES_FILE,'w') as f: json.dump(ovr, f)
-            self.log(f"Unpinned {sq}")
+        sq = self.ent_target.get(); d = {}
+        if os.path.exists(OVERRIDES_FILE): 
+            d = json.load(open(OVERRIDES_FILE))
+            if sq in d: del d[sq]; json.dump(d, open(OVERRIDES_FILE,'w')); self.log(f"Unpinned {sq}")
 
-    # --- SIMULATOR THREAD ---
     def run_move_test(self):
-        move_str = self.ent_move.get().strip().lower()
-        is_capture = self.chk_capture_var.get()
-        if len(move_str) != 4: return self.log("Error: Format e2e4")
-        self.log(f"Simulating: {move_str} (Cap: {is_capture})")
-        threading.Thread(target=self._sim_thread, args=(move_str[0:2], move_str[2:4], is_capture)).start()
+        threading.Thread(target=self._sim, args=(self.ent_move.get(), self.chk_cap.get())).start()
 
-    def _sim_thread(self, sq1, sq2, is_capture):
+    def _sim(self, m, cap):
         if not os.path.exists(ROBOT_CALIB): return self.log("No Calib.")
-        with open(ROBOT_CALIB,'r') as f: mapper = BoardMapper(json.load(f))
+        mapper = BoardMapper(json.load(open(ROBOT_CALIB)))
+        x1, y1 = mapper.get_coords(m[0:2]); x2, y2 = mapper.get_coords(m[2:4])
+        if cap:
+            self.log("Capturing..."); self.robot.release(); self.robot.move_to_xyz(x2, y2, z=Z_TRAVEL); time.sleep(1)
+            self.robot.move_to_xyz(x2, y2, z=Z_GRIP); time.sleep(0.5); self.robot.grasp(); time.sleep(0.5)
+            self.robot.move_to_xyz(x2, y2, z=Z_TRAVEL); time.sleep(0.5)
+            self.robot.send_cmd(180, 90, 90, 90, 180); time.sleep(1); self.robot.release(); time.sleep(0.5)
         
-        try:
-            x1, y1 = mapper.get_coords(sq1)
-            x2, y2 = mapper.get_coords(sq2)
-            
-            if is_capture:
-                self.log("Capturing...")
-                self.robot.release(); self.robot.move_to_xyz(x2, y2)
-                time.sleep(0.5); self.robot.grasp()
-                self.robot.send_cmd(180, 90, 90, 90, 180) # Dump
-                time.sleep(1.0); self.robot.release(); time.sleep(0.5)
-
-            self.log(f"Moving {sq1} to {sq2}...")
-            self.robot.release(); self.robot.move_to_xyz(x1, y1)
-            time.sleep(1.0); self.robot.grasp(); self.robot.move_to_xyz(x1, y1)
-            time.sleep(0.5); self.robot.send_cmd(90, 110, 160, 45, 180) # Lift
-            time.sleep(0.5); self.robot.move_to_xyz(x2, y2)
-            time.sleep(1.0); self.robot.release(); self.robot.move_to_xyz(x2, y2)
-            time.sleep(0.5); self.robot.home()
-            self.log("Move Complete.")
-        except Exception as e:
-            self.log(f"Sim Error: {e}")
-
-    # --- GAME THREADS ---
-    def run_cam(self): threading.Thread(target=self._cam, daemon=True).start()
-    def _cam(self): master_script.mode_cam_calib()
-    
-    def run_game(self): threading.Thread(target=self._game, daemon=True).start()
-    def _game(self): master_script.mode_play_game(self.robot)
+        self.log("Moving..."); self.robot.release(); self.robot.move_to_xyz(x1, y1, z=Z_TRAVEL); time.sleep(1)
+        self.robot.move_to_xyz(x1, y1, z=Z_GRIP); time.sleep(0.5); self.robot.grasp(); time.sleep(0.5)
+        self.robot.move_to_xyz(x1, y1, z=Z_TRAVEL); time.sleep(0.5); self.robot.move_to_xyz(x2, y2, z=Z_TRAVEL); time.sleep(1)
+        self.robot.move_to_xyz(x2, y2, z=Z_GRIP); time.sleep(0.5); self.robot.release(); time.sleep(0.5)
+        self.robot.move_to_xyz(x2, y2, z=Z_TRAVEL); time.sleep(0.5); self.robot.home(); self.log("Done.")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = RobotGUI(root)
-    root.mainloop()
+    root = tk.Tk(); app = RobotGUI(root); root.mainloop()
