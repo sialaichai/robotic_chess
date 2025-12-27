@@ -120,7 +120,7 @@ Press R to reset if the camera did not capture any legal move.
 Stopping: Press the red "STOP GAME & PARK" button to safely freeze the robot.
 
 📁 File Structure
-The script is designed as a "Monolith" (single file) for portability, but logically divided into 5 sections:
+The script is designed as a "Monolith" (single file: Robotchess.py) for portability, but logically divided into 5 sections:
 
 Section 1: Imports & Config: Constants for Serial ports, servo limits, and dimensions.
 
@@ -131,6 +131,9 @@ Section 3: Logic & Mapping: BoardMapper (coordinate interpolation) and RobotMoti
 Section 4: Vision & Loop: OpenCV processing and the main Game Loop state machine.
 
 Section 5: GUI: Tkinter interface.
+
+json files: calibration stores A1, A8, H1, H8, overrides: stores other squares using Pin, vision: stores the 4-outer corners of chess board.
+
 
 ⚠️ Troubleshooting
 Lighting Issues: If the vision system detects moves incorrectly, ensure lighting is even and there are no shadows falling across multiple squares.
