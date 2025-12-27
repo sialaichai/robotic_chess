@@ -76,6 +76,11 @@ Repeat for H1, H8, and A8.
 
 Click "Save Calibration File".
 
+Fine-tuning: After calibrating the 4 corners A1, A8, H1, H8, use the goto function to fine tune the
+location of other squares. Pin down the remaining squares once they are accurate located using hte Jog function.
+
+Note: DO NOT pin A1, A8, H1 and H8.
+
 Step 2: Vision Calibration
 Go to Tab 3: Vision Game.
 
@@ -108,7 +113,7 @@ Press SPACEBAR to scan.
 
 The Vision system will propose a move (e.g., "Verify: e2e4?").
 
-Press ENTER to confirm or ESC to cancel/retry.
+Press ENTER to confirm or ESC to cancel/retry. (Vision may compute the wrong moves)
 
 Press R to reset if the camera did not capture any legal move.
 
