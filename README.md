@@ -132,7 +132,10 @@ Section 4: Vision & Loop: OpenCV processing and the main Game Loop state machine
 
 Section 5: GUI: Tkinter interface.
 
-json files: calibration stores A1, A8, H1, H8, overrides: stores other squares using Pin, vision: stores the 4-outer corners of chess board.
+json files: 
+calibration stores A1, A8, H1, H8, 
+overrides stores coord and angles of other squares using Pin,
+vision: stores the grid of chess board during vision calibration.
 
 
 ⚠️ Troubleshooting
