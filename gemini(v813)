@@ -1,0 +1,308 @@
+# ==================================================================================
+# SECTION 5: GUI (SIMULATOR NOW MATCHES GAME PHYSICS)
+# ==================================================================================
+class RobotGUI:
+    def __init__(self, root):
+        self.root = root; self.root.title("Chess Robot Monolith v8.16 (Sim & Game Synced)")
+        self.root.geometry("600x850")
+        self.robot = ChessRobotArm()
+        self.mapper = BoardMapper(is_white_profile=True)
+        self.setup_ui()
+        self.b, self.s, self.e, self.w, self.g = 90, 90, 180, 18, GRIP_OPEN_ANGLE
+        self.load_calib_ui()
+        self.vis_running = False; self.vis_pts = {}; self.last_click = None
+
+    def log(self, msg): self.txt.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {msg}\n"); self.txt.see(tk.END)
+
+    def setup_ui(self):
+        tabs = ttk.Notebook(self.root); tabs.pack(expand=1, fill="both")
+        t_jog = ttk.Frame(tabs); tabs.add(t_jog, text='1. Jog & Calib')
+        t_test = ttk.Frame(tabs); tabs.add(t_test, text='2. Test & Fix')
+        t_game = ttk.Frame(tabs); tabs.add(t_game, text='3. Vision Game')
+
+        # --- JOG & CALIB ---
+        f_ctl = ttk.LabelFrame(t_jog, text="Manual Controls"); f_ctl.pack(pady=10)
+        self.step = tk.IntVar(value=2)
+        tk.Scale(f_ctl, from_=1, to=10, var=self.step, orient='h').pack()
+        
+        btns = [('W (Shld Up)',0,1,'w'), ('A (Base L)',1,0,'a'), ('S (Shld Dn)',1,1,'s'), ('D (Base R)',1,2,'d'),
+                ('I (Elbow)',3,1,'i'), ('J (Extend)',4,0,'j'), ('K (Elbow)',4,1,'k'), ('L (Curl)',4,2,'l'),
+                ('Open',5,0,'o'), ('Close',5,2,'p')]
+        bf = ttk.Frame(f_ctl); bf.pack(pady=10)
+        for t,r,c,k in btns: ttk.Button(bf, text=t, width=10, command=lambda k=k: self.jog(k)).grid(row=r, column=c)
+
+        f_cal = ttk.LabelFrame(t_jog, text="Calibration Profile (Select to Edit)"); f_cal.pack(pady=10, fill='x')
+        
+        self.edit_profile_var = tk.BooleanVar(value=True) 
+        row_prof = ttk.Frame(f_cal); row_prof.pack(pady=5)
+        ttk.Radiobutton(row_prof, text="Edit WHITE Profile", variable=self.edit_profile_var, value=True, command=self.reload_mapper_ui).pack(side="left", padx=10)
+        ttk.Radiobutton(row_prof, text="Edit BLACK Profile", variable=self.edit_profile_var, value=False, command=self.reload_mapper_ui).pack(side="left", padx=10)
+
+        ttk.Button(f_cal, text="1. Home", command=self.move_home).pack(fill='x')
+        for pt in ["a1", "h1", "h8", "a8"]: 
+            ttk.Button(f_cal, text=f"Save {pt.upper()}", command=lambda p=pt: self.save_pt(p)).pack(fill='x')
+        ttk.Button(f_cal, text="Save Calibration File", command=self.save_file).pack(fill='x')
+
+        # --- TEST TAB ---
+        f_tst = ttk.Frame(t_test); f_tst.pack(pady=10)
+        self.ent_sq = ttk.Entry(f_tst); self.ent_sq.pack()
+        ttk.Button(f_tst, text="Go To Square (Using Active Profile)", command=self.goto_sq).pack(pady=5)
+        ttk.Button(f_tst, text="Override (Pin XYZ)", command=self.pin_sq).pack(fill='x', pady=2)
+        ttk.Button(f_tst, text="Unpin (Delete Override)", command=self.unpin_sq).pack(fill='x')
+        
+        ttk.Label(f_tst, text="-- SIMULATOR --").pack(pady=10)
+        self.ent_mv = ttk.Entry(f_tst); self.ent_mv.pack()
+        self.chk_cap = tk.BooleanVar()
+        ttk.Checkbutton(f_tst, text="Capture?", var=self.chk_cap).pack()
+        ttk.Button(f_tst, text="Execute Move", command=self.run_sim).pack()
+
+        # --- GAME TAB ---
+        f_vis = ttk.LabelFrame(t_game, text="Vision"); f_vis.pack(pady=10, fill='x')
+        ttk.Button(f_vis, text="Start Camera Stream", command=self.start_vision_stream).pack(fill='x')
+        f_grid = ttk.Frame(f_vis); f_grid.pack()
+        for i, pt in enumerate(['a8','h8','a1','h1']): 
+            ttk.Button(f_grid, text=pt.upper(), command=lambda p=pt: self.assign_vis_pt(p)).grid(row=i//2, column=i%2)
+        
+        self.calib_side_var = tk.BooleanVar(value=True) 
+        ttk.Radiobutton(f_vis, text="Vision: White Side", variable=self.calib_side_var, value=True).pack()
+        ttk.Radiobutton(f_vis, text="Vision: Black Side", variable=self.calib_side_var, value=False).pack()
+        ttk.Button(f_vis, text="Save & Close", command=self.stop_vision_stream).pack(fill='x')
+
+        self.robot_color_var = tk.BooleanVar(value=True) 
+        ttk.Label(t_game, text="Select Game Mode", font=("Arial", 10, "bold")).pack(pady=10)
+        ttk.Radiobutton(t_game, text="Robot is WHITE (Moves First)", variable=self.robot_color_var, value=True).pack()
+        ttk.Radiobutton(t_game, text="Robot is BLACK (Waits)", variable=self.robot_color_var, value=False).pack()
+        
+        ttk.Button(t_game, text="START GAME", command=self.start_game_thread).pack(fill='x', pady=10)
+        
+        btn_stop = tk.Button(t_game, text="STOP GAME & PARK", bg="#ffcccc", fg="red", font=("Arial", 10, "bold"), command=self.stop_game_gracefully)
+        btn_stop.pack(fill='x', pady=5)
+
+        self.txt = tk.Text(self.root, height=10); self.txt.pack(fill='both')
+
+    def stop_game_gracefully(self):
+        self.stop_requested = True
+        self.log("STOP REQUESTED...")
+        if hasattr(self, 'game_thread') and self.game_thread.is_alive():
+            self.log("Game is running. Waiting for loop to finish and park...")
+        else:
+            self.log("Game not active. Parking immediately.")
+            self.robot.park()
+
+    def load_calib_ui(self):
+        self.mapper = BoardMapper(is_white_profile=self.edit_profile_var.get())
+        self.calib_pts = self.mapper.phys_cal.copy()
+        p = "WHITE" if self.edit_profile_var.get() else "BLACK"
+        self.log(f"Switched to {p} Profile.")
+
+    def reload_mapper_ui(self):
+        self.load_calib_ui()
+
+    def save_pt(self, n): 
+        x, y, z = get_xy_from_angles(self.b, self.s, self.e, self.w)
+        self.calib_pts[n] = [x, y]
+        self.log(f"Saved {n} [{x:.1f},{y:.1f}]")
+
+    def save_file(self):
+        is_white = self.edit_profile_var.get()
+        fn = "calibration_white.json" if is_white else "calibration_black.json"
+        json.dump(self.calib_pts, open(fn, 'w'))
+        self.reload_mapper_ui()
+        self.log(f"Saved to {fn}")
+
+    def pin_sq(self):
+        sq = self.ent_sq.get().strip().lower()
+        x, y, z = get_xy_from_angles(self.b, self.s, self.e, self.w)
+        d = self.mapper.ovr.copy()
+        d[sq] = [x, y, z, self.b, self.s, self.e, self.w, "ANGLES"]
+        
+        fn = self.mapper.ovr_file
+        json.dump(d, open(fn, 'w'))
+        self.reload_mapper_ui()
+        self.log(f"Pinned {sq} to {fn}")
+
+    def unpin_sq(self):
+        sq = self.ent_sq.get().strip().lower()
+        d = self.mapper.ovr.copy()
+        if sq in d: 
+            del d[sq]
+            json.dump(d, open(self.mapper.ovr_file, 'w'))
+            self.reload_mapper_ui()
+            self.log(f"Unpinned {sq}")
+
+    def jog(self, k):
+        s = self.step.get()
+        if k=='w': self.s+=s; 
+        if k=='s': self.s-=s
+        if k=='a': self.b+=s; 
+        if k=='d': self.b-=s
+        if k=='i': self.e+=s; 
+        if k=='k': self.e-=s
+        if k=='j': self.w-=s; 
+        if k=='l': self.w+=s
+        if k=='o': self.g=GRIP_OPEN_ANGLE; 
+        if k=='p': self.g=GRIP_CLOSED_ANGLE
+        self.robot.send_cmd(self.b, self.s, self.e, self.w, self.g)
+
+    def move_home(self):
+        self.b, self.s, self.e, self.w, self.g = 90, 90, 180, 18, GRIP_OPEN_ANGLE
+        self.robot.home()
+
+    def goto_sq(self):
+        sq = self.ent_sq.get().strip().lower()
+        if sq in self.mapper.ovr:
+            val = self.mapper.ovr[sq]
+            if len(val) > 5:
+                self.robot.send_cmd(val[3], val[4], val[5], val[6], GRIP_CLOSED_ANGLE)
+                self.b, self.s, self.e, self.w = val[3], val[4], val[5], val[6]; return
+        
+        x, y, z = self.mapper.get_coords(sq)
+        self.robot.move_to_xyz(x, y, z=Z_TRAVEL); time.sleep(0.5)
+        self.robot.move_to_xyz(x, y, z=z)
+        angles = self.robot.inverse_kinematics(x, y, z_height=z)
+        if angles: self.b, self.s, self.e, self.w = angles
+
+    def start_vision_stream(self):
+        if self.vis_running: return
+        self.vis_running = True; self.vis_pts = {}; self.last_click = None
+        self.calib_cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        cv2.namedWindow("Vision Setup")
+        cv2.setMouseCallback("Vision Setup", self._mouse_cb)
+        self._update_calibration_feed()
+
+    def _mouse_cb(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN: self.last_click = [x, y]
+
+    def _update_calibration_feed(self):
+        if not self.vis_running: 
+            if hasattr(self, 'calib_cap'): self.calib_cap.release()
+            cv2.destroyWindow("Vision Setup")
+            return
+        ret, frame = self.calib_cap.read()
+        if ret:
+            if self.last_click: 
+                cv2.drawMarker(frame, (self.last_click[0], self.last_click[1]), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+            for label, pt in self.vis_pts.items():
+                x, y = int(pt[0]), int(pt[1])
+                cv2.circle(frame, (x, y), 8, (0, 255, 0), -1) 
+                cv2.putText(frame, label.upper(), (x+12, y-12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4) 
+                cv2.putText(frame, label.upper(), (x+12, y-12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2) 
+            cv2.imshow("Vision Setup", frame)
+            cv2.waitKey(1)
+        self.root.after(10, self._update_calibration_feed)
+
+    def assign_vis_pt(self, sq):
+        if self.last_click: 
+            self.vis_pts[sq] = self.last_click
+            self.log(f"Saved Vision Point: {sq.upper()}")
+        else:
+            self.log("Click on camera feed first!")
+
+    def stop_vision_stream(self):
+        self.vis_running = False
+        self.root.after(100, self._finalize_vision_save)
+
+    def _finalize_vision_save(self):
+        try:
+            self.v_zones = interpolate_grid(self.vis_pts['a8'], self.vis_pts['h8'], self.vis_pts['h1'], self.vis_pts['a1'])
+            fn = "vision_white.json" if self.calib_side_var.get() else "vision_black.json"
+            with open(fn, 'w') as f: json.dump(self.v_zones, f)
+            with open("vision_grid.json", 'w') as f: json.dump(self.v_zones, f)
+            self.log(f"Vision Saved to {fn}")
+        except: 
+            self.log("Vision Error: Missing Points?")
+            messagebox.showerror("Error", "Please click all 4 corner buttons (A8, H8, A1, H1) before saving.")
+
+    def start_game_thread(self):
+        if hasattr(self, 'game_thread') and self.game_thread.is_alive(): return self.log("Game Running!")
+        self.stop_requested = False
+        self.game_thread = threading.Thread(target=run_vision_game, args=(self.robot, self.robot_color_var.get(), self))
+        self.game_thread.start()
+
+    def run_sim(self): threading.Thread(target=self._sim).start()
+    
+    # --- UPDATED SIMULATION TO MATCH GAME PHYSICS (Triple Grab) ---
+    def _sim(self):
+        m = self.ent_mv.get().strip().lower(); cap = (self.chk_cap.get() == 1)
+        
+        def smart_move(x, y, z, g):
+            angles = self.robot.inverse_kinematics(x, y, z_height=z)
+            if angles:
+                self.robot.send_cmd(angles[0], angles[1], angles[2], angles[3], g)
+                self.b, self.s, self.e, self.w, self.g = angles[0], angles[1], angles[2], angles[3], g
+                self.robot.gripper_state = g; time.sleep(0.8)
+            else: print(f"SIM ERR: {x:.1f},{y:.1f},{z:.1f}")
+
+        def raw_move(b, s, e, w, g):
+            self.robot.send_cmd(b, s, e, w, g)
+            self.b, self.s, self.e, self.w, self.g = b, s, e, w, g
+            time.sleep(0.8)
+
+        def grasp_piece_sim():
+            print("[SIM] Triple Grab...")
+            # 1. Close
+            raw_move(self.b, self.s, self.e, self.w, GRIP_CLOSED_ANGLE)
+            time.sleep(0.8)
+            # 2. Retry
+            self.robot.send_cmd(self.b, self.s, self.e, self.w, GRIP_CLOSED_ANGLE)
+            time.sleep(0.8)
+            # 3. Crush
+            CRUSH = min(180, GRIP_CLOSED_ANGLE + 15)
+            self.robot.send_cmd(self.b, self.s, self.e, self.w, CRUSH)
+            self.g = CRUSH
+            time.sleep(1.5)
+            print("[SIM] Secured.")
+
+        def land_and_grab(sq):
+            if sq in self.mapper.ovr and len(self.mapper.ovr[sq]) > 5:
+                val = self.mapper.ovr[sq]
+                raw_move(val[3], val[4], val[5], val[6], GRIP_OPEN_ANGLE)
+                grasp_piece_sim()
+                return
+
+            r = self.mapper.get_coords(sq)
+            tx, ty = r[0], r[1]
+            final_z = r[2] if len(r) > 2 and r[2] else Z_GRIP + max(MAX_TILT_DROP, (math.sqrt(tx**2 + ty**2)**2 * TILT_CURVE) + (math.sqrt(tx**2 + ty**2) * TILT_SLOPE) + TILT_INTERCEPT)
+
+            # Segmented Descent (Simulated)
+            start_z = Z_HOVER; steps = 5
+            for i in range(1, steps):
+                inter_z = start_z + (final_z - start_z) * (i / steps)
+                smart_move(tx, ty, inter_z, GRIP_OPEN_ANGLE)
+                time.sleep(0.05)
+            
+            smart_move(tx, ty, final_z, GRIP_OPEN_ANGLE)
+            grasp_piece_sim()
+
+        if len(m) < 4: return
+        x1, y1, _ = self.mapper.get_coords(m[0:2]); x2, y2, _ = self.mapper.get_coords(m[2:4])
+        self.robot.send_cmd(self.b, self.s, self.e, self.w, GRIP_OPEN_ANGLE); self.g = GRIP_OPEN_ANGLE
+        
+        if cap:
+            print(f"Sim Capture {m[2:4]}")
+            smart_move(x2, y2, Z_HOVER, GRIP_OPEN_ANGLE)
+            land_and_grab(m[2:4]) # Grabs piece at dest
+            smart_move(x2, y2, Z_HOVER, GRIP_CLOSED_ANGLE)
+            raw_move(180, 90, 90, 90, GRIP_CLOSED_ANGLE) 
+            raw_move(180, 90, 90, 90, GRIP_OPEN_ANGLE)
+            time.sleep(0.5)
+
+        print(f"Sim Move {m}")
+        smart_move(x1, y1, Z_HOVER, GRIP_OPEN_ANGLE)
+        land_and_grab(m[0:2]) # Go to Source, Land, Triple Grab
+        
+        smart_move(x1, y1, Z_HOVER, GRIP_CLOSED_ANGLE)
+        smart_move(x2, y2, Z_HOVER, GRIP_CLOSED_ANGLE)
+        
+        # Land at Dest (No grab needed, just place)
+        r = self.mapper.get_coords(m[2:4])
+        smart_move(r[0], r[1], r[2], GRIP_CLOSED_ANGLE)
+        raw_move(self.b, self.s, self.e, self.w, GRIP_OPEN_ANGLE)
+        
+        smart_move(x2, y2, Z_HOVER, GRIP_OPEN_ANGLE)
+        self.robot.home()
+
+if __name__ == "__main__":
+    root = tk.Tk(); app = RobotGUI(root)
+    def on_closing(): root.destroy(); os._exit(0)
+    root.protocol("WM_DELETE_WINDOW", on_closing); root.mainloop()

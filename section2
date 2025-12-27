@@ -1,0 +1,171 @@
+# ==================================================================================
+# SECTION 2: HARDWARE DRIVER
+# ==================================================================================
+class ChessRobotArm:
+    """
+    The Main Interface between the Python Logic and the Physical Robot.
+    
+    Responsibilities:
+    1. Establishes Serial (USB) communication with the Arduino/Controller.
+    2. Converts mathematical angles (Degrees) into electrical pulses (Microseconds).
+    3. Calculates Inverse Kinematics (Converting X/Y/Z coords into Joint Angles).
+    4. Enforces physical safety limits to prevent hardware damage.
+    """
+    def __init__(self, port='COM8'):
+        self.connected = False
+        try:
+            # Open the Serial Port. 9600 baud is the standard speed for Arduino.
+            # timeout=1 prevents the program from hanging forever if the wire is cut.
+            self.ser = serial.Serial(port, 9600, timeout=1)
+            print(f"[HW] Connected on {port}")
+            self.connected = True
+            
+            # CRITICAL WAIT: When an Arduino connects, it auto-resets. 
+            # We must wait 5 seconds for its bootloader to finish before sending commands.
+            # If we send data too early, it gets lost or confuses the controller.
+            time.sleep(5) 
+        except Exception as e:
+            # Graceful Fallback: If no robot is plugged in, the game continues 
+            # in "Simulation Mode" so you can test logic without hardware.
+            print(f"[HW] Simulation Mode: {e}")
+
+        # Initialize the gripper variable (does not physically move yet).
+        # We store this state so we can move X/Y/Z later without forgetting if the hand is open/closed.
+        self.gripper_state = self.deg_to_us(GRIP_OPEN_ANGLE) 
+
+    def deg_to_us(self, deg):
+        """
+        Converts human-readable Degrees (0-180) into Servo Pulse Widths (Microseconds).
+        Standard Servos (like MG996R) usually operate between 500us (0 deg) and 2500us (180 deg).
+        This function maps the range specifically to 400us - 2400us.
+        """
+        d = max(0, min(180, deg)) # Clamp input to 0-180 for safety
+        return int((d / 180.0) * (2400 - 400) + 400)
+
+    def send_cmd(self, b, s, e, w, g):
+        """
+        The detailed "Move" command.
+        
+        Args:
+            b (Base), s (Shoulder), e (Elbow), w (Wrist): Target Angles in Degrees.
+            g (Gripper): Target Pulse Width (Microseconds) OR Angle (depending on usage).
+        """
+        if not self.connected: return
+
+        # 1. APPLY OFFSETS: Add calibration values. 
+        # (e.g., If the servo is mounted 4 degrees off-center, we add 4 here).
+        # 2. APPLY CLAMPS: Hard safety limits (SHLD_MIN, etc.) defined in Config.
+        # This prevents the robot from hitting itself or ripping wires.
+        b_final = max(0, min(180, b + OFFSET_BASE))
+        s_final = max(SHLD_MIN, min(SHLD_MAX, s + OFFSET_SHOULDER))
+        e_final = max(ELBW_MIN, min(ELBW_MAX, e + OFFSET_ELBOW))
+        w_final = max(WRST_MIN, min(WRST_MAX, w + OFFSET_WRIST))
+        
+        # --- ENABLED DEBUGGING HERE ---
+        # This prints the FINAL angles being sent to the hardware.
+        # Useful for troubleshooting if the robot moves to the wrong spot.
+        print(f"[HW] B{b_final:.0f} S{s_final:.0f} E{e_final:.0f} W{w_final:.0f} G{g}")
+        
+        # Format the command string as CSV: "Base,Shoulder,Elbow,Wrist,Gripper\n"
+        msg = f"{self.deg_to_us(b_final)},{self.deg_to_us(s_final)},{self.deg_to_us(e_final)},{self.deg_to_us(w_final)},{self.deg_to_us(g)}\n"
+        self.ser.write(msg.encode()) 
+        
+        # BLOCKING WAIT:
+        # We sit in this loop and do NOTHING until the Arduino replies "done".
+        # This ensures the Python script stays synchronized with the physical robot motion.
+        # Without this, Python would send commands faster than the robot can move.
+        while True:
+            if self.ser.in_waiting and self.ser.readline().decode().strip() == "done": break
+
+    def park(self):
+        """
+        Sends the robot to a hardcoded "Rest" position.
+        Uses raw microseconds directly to bypass IK/Offset logic for a guaranteed safe pose.
+        """
+        if not self.connected: return
+        print("[HW] Parking...")
+        # 1550, 1400... are specific pulse widths found to be a compact storage position.
+        msg = f"1550,1400,1289,1289,{self.deg_to_us(GRIP_CLOSED_ANGLE)}\n"
+        self.ser.write(msg.encode())
+        while True:
+            if self.ser.in_waiting and self.ser.readline().decode().strip() == "done": break
+
+    def inverse_kinematics(self, x, y, z_height=Z_TRAVEL):
+        """
+        Calculates the Joint Angles required to reach a specific (X, Y, Z) coordinate.
+        Uses Geometric Inverse Kinematics (Law of Cosines).
+        
+        Args:
+            x, y: Horizontal coordinates on the board (cm).
+            z_height: Vertical height above the board (cm).
+        Returns:
+            (Base, Shoulder, Elbow, Wrist) angles OR None if unreachable.
+        """
+        # 1. Base Angle: Simple trigonometry (arctangent of Y/X).
+        base_angle = math.atan2(y, x) * 180 / math.pi
+        if base_angle < 0: base_angle += 360 
+        
+        # 2. Plane Projection: Calculate distance from Base center to Target (hypotenuse).
+        r_total = math.sqrt(x**2 + y**2)
+        z_final = z_height
+        
+        best_sol = None
+        
+        # 3. Wrist Pitch Search:
+        # The robot iterates through different wrist angles (pitch) to find a valid solution.
+        # It prefers -90 degrees (pointing straight down) but will adjust if needed.
+        for pitch in range(-90, 5, 5): 
+            rad_p = math.radians(pitch)
+            
+            # Calculate the Wrist position relative to the gripper tip
+            dr = L_WRIST * math.cos(rad_p); dz = L_WRIST * math.sin(rad_p)
+            
+            # Determine the target point for the Wrist Joint (Coordinate transformation)
+            # We subtract the Base Height (L_BASE_H) to work in the arm's plane.
+            r_w = r_total - dr; z_w = (z_final - dz) - L_BASE_H 
+            
+            # 'h' is the distance from Shoulder Joint to Wrist Joint
+            h = math.sqrt(r_w**2 + z_w**2)
+            
+            # Reach Check: If distance > arm length, it's unreachable.
+            if h > (L_SHOULDER + L_ELBOW): continue 
+            
+            try:
+                # Law of Cosines to find Shoulder (alpha) and Elbow (beta) internal angles.
+                alpha = math.acos((L_SHOULDER**2 + h**2 - L_ELBOW**2) / (2 * L_SHOULDER * h))
+                beta = math.acos((L_SHOULDER**2 + L_ELBOW**2 - h**2) / (2 * L_SHOULDER * L_ELBOW))
+            except ValueError: continue # Triangle impossible (Math Domain Error)
+            
+            # Convert internal triangle angles to Servo Global Angles
+            theta = math.atan2(z_w, r_w) # Angle of the virtual line 'h'
+            s = (theta + alpha) * 180 / math.pi; e = beta * 180 / math.pi
+            
+            # Calculate Wrist angle to maintain the desired 'pitch' relative to the ground.
+            w = (s - (180 - e)) - pitch 
+            
+            # Safety Checks
+            if s > SHLD_MAX: continue 
+            
+            # OPTIMIZATION:
+            # If we find a solution where the Shoulder is safe (>= 55 deg), take it immediately.
+            # This prevents the arm from folding too close to the electronics.
+            if s >= MIN_SAFE_SHOULDER_ANGLE: return base_angle, s, e, w
+            
+            # Fallback: Keep the "least bad" solution if a perfect one isn't found
+            if best_sol is None or s > best_sol[1]: best_sol = (base_angle, s, e, w)
+            
+        return best_sol 
+
+    def move_to_xyz(self, x, y, z=Z_TRAVEL):
+        """
+        High-level wrapper:
+        1. Calculates angles for X, Y, Z.
+        2. If valid, sends command to robot maintaining current gripper state.
+        """
+        angles = self.inverse_kinematics(x, y, z_height=z)
+        if angles:
+            self.send_cmd(*angles, self.gripper_state)
+            return True
+        return False
+    
+    def home(self): self.send_cmd(90, 90, 180, 18, GRIP_OPEN_ANGLE) # Safe "Up and Center" pose

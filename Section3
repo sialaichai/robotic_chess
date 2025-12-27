@@ -1,0 +1,300 @@
+# ==================================================================================
+# SECTION 3: MATH HELPERS & THE UNIFIED "ROBOT MOTION" BRAIN
+# ==================================================================================
+
+def get_xy_from_angles(b, s, e, w):
+    """
+    FORWARD KINEMATICS HELPER.
+    calculates "Where is the robot hand now?" based on its servo angles.
+    
+    Why we need this: 
+    To perform a vertical lift, we must know the CURRENT X/Y coordinates 
+    so we can command the robot to go to (Current_X, Current_Y, High_Z).
+    Without this, the robot might try to lift by returning to (0,0), causing a crash.
+    """
+    rb, rs = math.radians(b), math.radians(s)
+    # Calculate global angles relative to the horizon
+    ge = s - (180 - e); re = math.radians(ge)
+    gw = ge - w; rw = math.radians(gw)
+    
+    # Calculate the horizontal reach (radius) from base center
+    r = (L_SHOULDER*math.cos(rs)) + (L_ELBOW*math.cos(re)) + (L_WRIST*math.cos(rw))
+    # Calculate the vertical height (Z) from table
+    z = L_BASE_H + (L_SHOULDER*math.sin(rs)) + (L_ELBOW*math.sin(re)) + (L_WRIST*math.sin(rw))
+    
+    # Convert polar coordinates (Radius, Angle) to Cartesian (X, Y)
+    return r * math.cos(rb), r * math.sin(rb), z
+
+class BoardMapper:
+    """
+    THE COORDINATE SYSTEM MANAGER.
+    Responsible for translating "e2" into "x=12.5, y=-4.2, z=2.1".
+    Handles the difference between playing as White vs Black via profiles.
+    """
+    def __init__(self, is_white_profile=True):
+        suffix = "white" if is_white_profile else "black"
+        # Load specific calibration files for the chosen side
+        self.cal_file = f"calibration_{suffix}.json"
+        self.ovr_file = f"overrides_{suffix}.json"
+        
+        print(f"[MAPPER] Loading Profile: {suffix.upper()}")
+
+        # 1. LOAD OVERRIDES (Specific squares manually pinned by user)
+        self.ovr = {}
+        if os.path.exists(self.ovr_file):
+            try: self.ovr = json.load(open(self.ovr_file, "r"))
+            except: pass
+            
+        # 2. LOAD CORNER CALIBRATION (The 4 corners of the board)
+        self.phys_cal = {}
+        if os.path.exists(self.cal_file):
+             with open(self.cal_file, "r") as f: self.phys_cal = json.load(f)
+        else:
+             print(f"[WARN] No {self.cal_file} found. Defaulting to empty.")
+
+    def get_coords(self, sq):
+            """
+            The Master Function to find a square.
+            Priority:
+            1. Manual Override (User pinned this exact square).
+            2. Calibrated Grid (User set 4 corners, we interpolate the rest).
+            """
+            sq = sq.strip().lower()
+            
+            # --- CHECK PRIORITY 1: MANUAL OVERRIDE ---
+            if sq in self.ovr:
+                val = self.ovr[sq]
+                # If override has X, Y, Z data, return it immediately.
+                if len(val) >= 3: return val[0], val[1], val[2]
+            
+            # --- CHECK PRIORITY 2: DIRECT CALIBRATION ---
+            if sq in self.phys_cal:
+                x, y = self.phys_cal[sq]
+                # Auto-calculate Z based on distance (Tilt Correction)
+                dist = math.sqrt(x**2 + y**2)
+                z = max(MAX_TILT_DROP, (dist**2 * TILT_CURVE) + (dist * TILT_SLOPE) + TILT_INTERCEPT) + Z_GRIP
+                return x, y, z
+
+            # --- PRIORITY 3: BILINEAR INTERPOLATION (The Grid Math) ---
+            # If we know the 4 corners (A1, A8, H1, H8), we can calculate any square inside.
+            col = ord(sq[0]) - ord('a'); row = int(sq[1]) - 1        
+            xa1, ya1 = self.phys_cal.get("a1", [0,0]); xa8, ya8 = self.phys_cal.get("a8", [0,1])
+            xh1, yh1 = self.phys_cal.get("h1", [1,0]); xh8, yh8 = self.phys_cal.get("h8", [1,1])
+
+            # Calculate percentages (0.0 to 1.0) for row/col position
+            u = col / 7.0; v = row / 7.0
+            
+            # Standard Bilinear Interpolation Formula
+            x = (1-u)*(1-v)*xa1 + u*(1-v)*xh1 + u*v*xh8 + (1-u)*v*xa8
+            y = (1-u)*(1-v)*ya1 + u*(1-v)*yh1 + u*v*yh8 + (1-u)*v*ya8
+            
+            # Auto-Z Calculation (Tilt Correction)
+            # As the arm extends, the wrist naturally tilts down. This formula raises Z
+            # slightly at further distances to keep the gripper from hitting the board.
+            dist = math.sqrt(x**2 + y**2)
+            z = max(MAX_TILT_DROP, (dist**2 * TILT_CURVE) + (dist * TILT_SLOPE) + TILT_INTERCEPT) + Z_GRIP
+            return x, y, z
+
+
+# --- THE UNIFIED BRAIN CLASS (v17.6: Fixed Timing/Dragging) ---
+class RobotMotion:
+    """
+    THE MOTION CONTROLLER.
+    This class owns the logic for HOW to move (Square Wave, Linear Paths).
+    It is used by both the Game Loop and the Simulator/GUI to ensure consistent behavior.
+    """
+    def __init__(self, robot, mapper, stop_check_callback):
+        self.robot = robot
+        self.mapper = mapper
+        self.check_stop = stop_check_callback # Lambda function to check if User pressed "STOP"
+        
+        # Keep track of last known angles to allow relative movements
+        self.cur_b, self.cur_s, self.cur_e, self.cur_w = 90, 90, 180, 18
+        
+        # Track where we are physically (X, Y) to ensure vertical lifts work correctly.
+        self.last_x = 0
+        self.last_y = 20
+        
+        # GRIP CONFIG
+        self.GRIP_FORCE = 100        # Tightness when holding a piece
+        self.current_grip = GRIP_OPEN_ANGLE 
+
+    def safe_wait(self, duration):
+        """Interruptible sleep. Checks for 'STOP' button every moment."""
+        if self.check_stop(): return
+        time.sleep(duration)
+
+    # --- GRIP COMMANDS ---
+    def lock_hand(self):
+        if self.check_stop(): return
+        print(f"[MOTION] Locking Hand at {self.GRIP_FORCE}...")
+        self.current_grip = self.GRIP_FORCE 
+        # Re-send current position with NEW grip value
+        self.robot.send_cmd(self.cur_b, self.cur_s, self.cur_e, self.cur_w, self.current_grip)
+        self.robot.gripper_state = self.current_grip
+        time.sleep(0.5) # Wait for servo to physically close
+
+    def open_hand(self):
+        print("[MOTION] Opening Hand...")
+        self.current_grip = GRIP_OPEN_ANGLE
+        self.robot.send_cmd(self.cur_b, self.cur_s, self.cur_e, self.cur_w, self.current_grip)
+        self.robot.gripper_state = self.current_grip
+        time.sleep(0.3) # Wait for servo to physically open
+
+    # --- MOVEMENT CORE ---
+    def raw_move(self, b, s, e, w):
+        """Direct Joint Control (used mostly for overrides)."""
+        if self.check_stop(): return
+        self.cur_b, self.cur_s, self.cur_e, self.cur_w = b, s, e, w
+        self.robot.send_cmd(b, s, e, w, self.current_grip) 
+
+    def smart_move_xyz(self, x, y, z):
+        """Inverse Kinematics Move. Calculates angles for target X,Y,Z."""
+        if self.check_stop(): return
+        
+        # CRITICAL: Save these coords! We need them for the vertical lift later.
+        self.last_x = x
+        self.last_y = y
+        
+        angles = self.robot.inverse_kinematics(x, y, z_height=z)
+        if angles:
+            self.raw_move(angles[0], angles[1], angles[2], angles[3])
+        else:
+            print(f"[WARN] Unreachable: {x:.1f}, {y:.1f}, {z:.1f}")
+
+    # --- CRITICAL SQUARE WAVE FUNCTIONS ---
+    
+    def land_on_square(self, sq):
+        """Calculates precise landing spot and moves there."""
+        if self.check_stop(): return
+        
+        # 1. Check for Manual Overrides (Pinned exact servo angles)
+        if sq in self.mapper.ovr and len(self.mapper.ovr[sq]) > 5:
+            val = self.mapper.ovr[sq]
+            r = self.mapper.get_coords(sq)
+            self.last_x, self.last_y = r[0], r[1] 
+            self.raw_move(val[3], val[4], val[5], val[6])
+            return
+
+        # 2. Calculate Geometry (Standard Grid)
+        r = self.mapper.get_coords(sq)
+        tx, ty = r[0], r[1]
+        # Use calculated Z unless the override provided a specific Z
+        final_z = r[2] if len(r) > 2 and r[2] else Z_GRIP + max(MAX_TILT_DROP, (math.sqrt(tx**2 + ty**2)**2 * TILT_CURVE) + (math.sqrt(tx**2 + ty**2) * TILT_SLOPE) + TILT_INTERCEPT)
+        
+        # 3. Move
+        self.smart_move_xyz(tx, ty, final_z)
+
+    def lift_vertical(self):
+        """
+        STRICT VERTICAL LIFT.
+        1. Uses self.last_x/y to stay exactly where we are.
+        2. Raises Z to Z_HOVER (13.0cm).
+        3. Waits 0.5s to ensure the arm is fully UP before any sideways motion begins.
+        This prevents the 'dragging' effect on the board.
+        """
+        if self.check_stop(): return
+        self.smart_move_xyz(self.last_x, self.last_y, Z_HOVER)
+        time.sleep(0.5) # <--- THIS FIXES THE DRAGGING
+
+    def run_linear_path(self, x1, y1, x2, y2):
+        """
+        LINEAR INTERPOLATION (The Anti-Arc Solution).
+        Instead of moving A->B directly (which creates a dipping arc),
+        we chop the line into small steps (every 5cm).
+        This forces the robot to recalculate Inverse Kinematics constantly,
+        keeping the Z-height perfectly flat at Z_HOVER.
+        """
+        dist = math.sqrt((x2-x1)**2 + (y2-y1)**2)
+        steps = max(2, int(dist / 5.0)) 
+        
+        for i in range(1, steps + 1):
+            if self.check_stop(): break
+            t = i / steps
+            # Lerp (Linear Interpolation) math
+            curr_x = x1 + (x2 - x1) * t
+            curr_y = y1 + (y2 - y1) * t
+            self.smart_move_xyz(curr_x, curr_y, Z_HOVER)
+
+    # --- GUI COMPATIBILITY FIX ---
+    def travel_straight(self, start_sq, end_sq):
+        """
+        Forces Square Wave Sequence for GUI interactions:
+        Lift (Current Position) -> Wait -> Fly (Target Position) -> Land
+        """
+        if self.check_stop(): return
+        
+        # 1. LIFT VERTICAL (From Current Position)
+        # The 0.5s sleep in lift_vertical ensures we are HIGH UP 
+        # before the next command executes.
+        self.lift_vertical()
+        
+        # 2. GET TARGET COORDS
+        xt, yt, _ = self.mapper.get_coords(end_sq)
+        
+        # 3. FLY TO TARGET (At Hover Height using direct move for speed)
+        # Note: For very long moves, run_linear_path is better, but this suffices for simple tests.
+        self.smart_move_xyz(xt, yt, Z_HOVER)
+        
+        # 4. LAND (Vertical Drop)
+        self.land_on_square(end_sq)
+
+    # --- GAME LOGIC ---
+    def execute_move(self, sq_src, sq_dst):
+        """The Standard Move Sequence (Pick and Place)."""
+        print(f"[MOTION] Executing Move: {sq_src} -> {sq_dst}")
+        x_src, y_src, z_src = self.mapper.get_coords(sq_src)
+        x_dst, y_dst, z_dst = self.mapper.get_coords(sq_dst)
+
+        # 1. Approach Source
+        self.open_hand()
+        self.smart_move_xyz(x_src, y_src, Z_HOVER) # Hover above piece
+        self.land_on_square(sq_src)                # Drop down
+        
+        # 2. Grab
+        self.lock_hand()
+        
+        # 3. Lift (Now includes 0.5s wait to clear other pieces)
+        self.lift_vertical()
+        
+        # 4. Carry (Using Linear Path to stay high and flat)
+        self.run_linear_path(self.last_x, self.last_y, x_dst, y_dst)
+        
+        # 5. Drop
+        self.land_on_square(sq_dst)
+        self.open_hand()
+        self.lift_vertical() # Move away safely
+
+    def execute_capture(self, sq_src, sq_dst):
+        """
+        The Capture Sequence.
+        Requires TWO movements:
+        1. Pick up the Enemy piece and dump it in the 'Trash Zone'.
+        2. Move the Friendly piece to the destination.
+        """
+        print(f"[MOTION] Executing Capture: {sq_src} x {sq_dst}")
+        x_vic, y_vic, _ = self.mapper.get_coords(sq_dst)
+        trash_x, trash_y, trash_z = -20.0, 0.0, 10.0 # Hardcoded Trash Location (Side of board)
+        
+        # --- PHASE 1: REMOVE VICTIM ---
+        self.open_hand()
+        self.smart_move_xyz(x_vic, y_vic, Z_HOVER)
+        self.land_on_square(sq_dst)
+        self.lock_hand() 
+        
+        # 1. LIFT
+        self.lift_vertical()
+        
+        # 2. CARRY TO TRASH
+        self.run_linear_path(self.last_x, self.last_y, trash_x, trash_y)
+        
+        # 3. DROP IN TRASH
+        self.smart_move_xyz(trash_x, trash_y, trash_z) 
+        self.open_hand() 
+        
+        # 4. RECOVER (Go back up to hover height)
+        self.smart_move_xyz(trash_x, trash_y, Z_HOVER)
+        
+        # --- PHASE 2: MOVE ATTACKER ---
+        # Now perform the standard move for the attacking piece
+        self.execute_move(sq_src, sq_dst)

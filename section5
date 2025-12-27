@@ -1,0 +1,332 @@
+# ==================================================================================
+# SECTION 5: GUI (NOW USES UNIFIED MOTION CLASS)
+# ==================================================================================
+class RobotGUI:
+    """
+    THE COMMAND CENTER.
+    A Tkinter-based interface that allows:
+    1. Manual 'Jogging' of the robot to find coordinates.
+    2. Vision Calibration (clicking the board corners).
+    3. Launching the main Auto-Chess Game Loop.
+    """
+    def __init__(self, root):
+        self.root = root; self.root.title("Chess Robot Monolith v8.20 (Fix Grip Crash)")
+        self.root.geometry("600x850")
+        
+        # Initialize the hardware drivers
+        self.robot = ChessRobotArm()
+        self.mapper = BoardMapper(is_white_profile=True)
+        
+        self.setup_ui()
+        
+        # Internal state for manual jogging
+        self.b, self.s, self.e, self.w, self.g = 90, 90, 180, 18, GRIP_OPEN_ANGLE
+        
+        self.load_calib_ui()
+        
+        # Vision Calibration State
+        self.vis_running = False; self.vis_pts = {}; self.last_click = None
+
+    def log(self, msg): 
+        """Thread-safe logging to the text box at the bottom."""
+        self.txt.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {msg}\n"); self.txt.see(tk.END)
+
+    def setup_ui(self):
+        """Builds the 3-Tab Interface."""
+        tabs = ttk.Notebook(self.root); tabs.pack(expand=1, fill="both")
+        
+        # TAB 1: JOG (Manual Control & Physical Calibration)
+        t_jog = ttk.Frame(tabs); tabs.add(t_jog, text='1. Jog & Calib')
+        
+        # TAB 2: TEST (Simulator & Single Move Testing)
+        t_test = ttk.Frame(tabs); tabs.add(t_test, text='2. Test & Fix')
+        
+        # TAB 3: GAME (Camera Setup & Auto-Play)
+        t_game = ttk.Frame(tabs); tabs.add(t_game, text='3. Vision Game')
+
+        # --- JOG & CALIB TAB SETUP ---
+        f_ctl = ttk.LabelFrame(t_jog, text="Manual Controls"); f_ctl.pack(pady=10)
+        
+        # Speed Slider
+        self.step = tk.IntVar(value=2)
+        tk.Scale(f_ctl, from_=1, to=10, var=self.step, orient='h').pack()
+        
+        # The WASD-style control grid
+        btns = [('W (Shld Up)',0,1,'w'), ('A (Base L)',1,0,'a'), ('S (Shld Dn)',1,1,'s'), ('D (Base R)',1,2,'d'),
+                ('I (Elbow)',3,1,'i'), ('J (Extend)',4,0,'j'), ('K (Elbow)',4,1,'k'), ('L (Curl)',4,2,'l'),
+                ('Open',5,0,'o'), ('Close',5,2,'p')]
+        bf = ttk.Frame(f_ctl); bf.pack(pady=10)
+        for t,r,c,k in btns: ttk.Button(bf, text=t, width=10, command=lambda k=k: self.jog(k)).grid(row=r, column=c)
+
+        # Profile Switcher (White vs Black calibration)
+        f_cal = ttk.LabelFrame(t_jog, text="Calibration Profile (Select to Edit)"); f_cal.pack(pady=10, fill='x')
+        self.edit_profile_var = tk.BooleanVar(value=True) 
+        row_prof = ttk.Frame(f_cal); row_prof.pack(pady=5)
+        ttk.Radiobutton(row_prof, text="Edit WHITE Profile", variable=self.edit_profile_var, value=True, command=self.reload_mapper_ui).pack(side="left", padx=10)
+        ttk.Radiobutton(row_prof, text="Edit BLACK Profile", variable=self.edit_profile_var, value=False, command=self.reload_mapper_ui).pack(side="left", padx=10)
+
+        # Calibration Saving Buttons
+        ttk.Button(f_cal, text="1. Home", command=self.move_home).pack(fill='x')
+        for pt in ["a1", "h1", "h8", "a8"]: 
+            ttk.Button(f_cal, text=f"Save {pt.upper()}", command=lambda p=pt: self.save_pt(p)).pack(fill='x')
+        ttk.Button(f_cal, text="Save Calibration File", command=self.save_file).pack(fill='x')
+
+        # --- TEST TAB SETUP ---
+        f_tst = ttk.Frame(t_test); f_tst.pack(pady=10)
+        self.ent_sq = ttk.Entry(f_tst); self.ent_sq.pack()
+        ttk.Button(f_tst, text="Go To Square (Using Active Profile)", command=self.goto_sq).pack(pady=5)
+        
+        # Override Controls (The "Pin" feature)
+        ttk.Button(f_tst, text="Override (Pin XYZ)", command=self.pin_sq).pack(fill='x', pady=2)
+        ttk.Button(f_tst, text="Unpin (Delete Override)", command=self.unpin_sq).pack(fill='x')
+        
+        # Simulator Controls
+        ttk.Label(f_tst, text="-- SIMULATOR --").pack(pady=10)
+        self.ent_mv = ttk.Entry(f_tst); self.ent_mv.pack()
+        self.chk_cap = tk.BooleanVar()
+        ttk.Checkbutton(f_tst, text="Capture?", var=self.chk_cap).pack()
+        ttk.Button(f_tst, text="Execute Move", command=self.run_sim).pack()
+
+        # --- GAME TAB SETUP ---
+        f_vis = ttk.LabelFrame(t_game, text="Vision"); f_vis.pack(pady=10, fill='x')
+        ttk.Button(f_vis, text="Start Camera Stream", command=self.start_vision_stream).pack(fill='x')
+        
+        # Visual Grid Buttons (A8, H8, A1, H1) to assign clicks
+        f_grid = ttk.Frame(f_vis); f_grid.pack()
+        for i, pt in enumerate(['a8','h8','a1','h1']): 
+            ttk.Button(f_grid, text=pt.upper(), command=lambda p=pt: self.assign_vis_pt(p)).grid(row=i//2, column=i%2)
+        
+        self.calib_side_var = tk.BooleanVar(value=True) 
+        ttk.Radiobutton(f_vis, text="Vision: White Side", variable=self.calib_side_var, value=True).pack()
+        ttk.Radiobutton(f_vis, text="Vision: Black Side", variable=self.calib_side_var, value=False).pack()
+        ttk.Button(f_vis, text="Save & Close", command=self.stop_vision_stream).pack(fill='x')
+
+        # Game Start/Stop
+        self.robot_color_var = tk.BooleanVar(value=True) 
+        ttk.Label(t_game, text="Select Game Mode", font=("Arial", 10, "bold")).pack(pady=10)
+        ttk.Radiobutton(t_game, text="Robot is WHITE (Moves First)", variable=self.robot_color_var, value=True).pack()
+        ttk.Radiobutton(t_game, text="Robot is BLACK (Waits)", variable=self.robot_color_var, value=False).pack()
+        
+        ttk.Button(t_game, text="START GAME", command=self.start_game_thread).pack(fill='x', pady=10)
+        
+        # THE BIG RED BUTTON
+        btn_stop = tk.Button(t_game, text="STOP GAME & PARK", bg="#ffcccc", fg="red", font=("Arial", 10, "bold"), command=self.stop_game_gracefully)
+        btn_stop.pack(fill='x', pady=5)
+
+        self.txt = tk.Text(self.root, height=10); self.txt.pack(fill='both')
+
+    def stop_game_gracefully(self):
+        """
+        Sets a flag that the running Game Loop checks.
+        Allows the robot to finish its current micro-move before stopping.
+        """
+        self.stop_requested = True
+        self.log("STOP REQUESTED...")
+        if hasattr(self, 'game_thread') and self.game_thread.is_alive():
+            self.log("Game is running. Waiting for loop to finish and park...")
+        else:
+            self.log("Game not active. Parking immediately.")
+            self.robot.park()
+
+    # --- CALIBRATION HELPERS ---
+    def load_calib_ui(self):
+        """Reloads coordinate data when switching profiles."""
+        self.mapper = BoardMapper(is_white_profile=self.edit_profile_var.get())
+        self.calib_pts = self.mapper.phys_cal.copy()
+        p = "WHITE" if self.edit_profile_var.get() else "BLACK"
+        self.log(f"Switched to {p} Profile.")
+
+    def reload_mapper_ui(self):
+        self.load_calib_ui()
+
+    def save_pt(self, n): 
+        """Saves current robot position as a board corner (e.g., A1)."""
+        x, y, z = get_xy_from_angles(self.b, self.s, self.e, self.w)
+        self.calib_pts[n] = [x, y]
+        self.log(f"Saved {n} [{x:.1f},{y:.1f}]")
+
+    def save_file(self):
+        """Writes the physical calibration to disk."""
+        is_white = self.edit_profile_var.get()
+        fn = "calibration_white.json" if is_white else "calibration_black.json"
+        json.dump(self.calib_pts, open(fn, 'w'))
+        self.reload_mapper_ui()
+        self.log(f"Saved to {fn}")
+
+    def pin_sq(self):
+        """
+        MANUAL OVERRIDE.
+        If a specific square is always missing, the user can jog the robot there
+        and 'Pin' it. This overrides the mathematical grid for that one square.
+        """
+        sq = self.ent_sq.get().strip().lower()
+        x, y, z = get_xy_from_angles(self.b, self.s, self.e, self.w)
+        d = self.mapper.ovr.copy()
+        # Save exact angles, not just XYZ, to be safe
+        d[sq] = [x, y, z, self.b, self.s, self.e, self.w, "ANGLES"]
+        
+        fn = self.mapper.ovr_file
+        json.dump(d, open(fn, 'w'))
+        self.reload_mapper_ui()
+        self.log(f"Pinned {sq} to {fn}")
+
+    def unpin_sq(self):
+        sq = self.ent_sq.get().strip().lower()
+        d = self.mapper.ovr.copy()
+        if sq in d: 
+            del d[sq]
+            json.dump(d, open(self.mapper.ovr_file, 'w'))
+            self.reload_mapper_ui()
+            self.log(f"Unpinned {sq}")
+
+    # --- JOGGING ---
+    def jog(self, k):
+        """Increments servo angles based on button clicks."""
+        s = self.step.get()
+        if k=='w': self.s+=s; 
+        if k=='s': self.s-=s
+        if k=='a': self.b+=s; 
+        if k=='d': self.b-=s
+        if k=='i': self.e+=s; 
+        if k=='k': self.e-=s
+        if k=='j': self.w-=s; 
+        if k=='l': self.w+=s
+        if k=='o': self.g=GRIP_OPEN_ANGLE; 
+        if k=='p': self.g=GRIP_CLOSED_ANGLE
+        self.robot.send_cmd(self.b, self.s, self.e, self.w, self.g)
+
+    def move_home(self):
+        self.b, self.s, self.e, self.w, self.g = 90, 90, 180, 18, GRIP_OPEN_ANGLE
+        self.robot.home()
+
+    def goto_sq(self):
+        """
+        Moves to a square using the UNIFIED BRAIN.
+        This ensures the GUI test behaves exactly like the real game 
+        (including the vertical lift/anti-drag logic).
+        """
+        sq = self.ent_sq.get().strip().lower()
+
+        # 1. Instantiate the Brain (Same as Simulator)
+        # We pass a dummy lambda for the stop check because we want this to force-run
+        motion = RobotMotion(self.robot, self.mapper, lambda: False)
+
+        # 2. SYNC BRAIN WITH REALITY
+        # We must tell the Brain where the robot physically IS right now.
+        cur_x, cur_y, _ = get_xy_from_angles(self.b, self.s, self.e, self.w)
+        motion.last_x = cur_x
+        motion.last_y = cur_y
+        motion.current_grip = self.g # Sync gripper state
+
+        # 3. EXECUTE ROBUST SQUARE WAVE
+        # This reuses the EXACT logic from the game loop:
+        
+        # A. Vertical Lift (Safe)
+        motion.lift_vertical() 
+        
+        # B. Linear Path (The Anti-Drag Interpolation)
+        # We need the target coordinates for the path calculation
+        dest_x, dest_y, dest_z = self.mapper.get_coords(sq)
+        motion.run_linear_path(cur_x, cur_y, dest_x, dest_y)
+        
+        # C. Land (Precision Drop)
+        motion.land_on_square(sq)
+
+        # 4. Update GUI Memory
+        # Sync the GUI's variables with where the Brain left the robot
+        if motion.last_x != 0:
+            angles = self.robot.inverse_kinematics(dest_x, dest_y, z_height=dest_z)
+            if angles: self.b, self.s, self.e, self.w = angles
+        
+    # --- VISION SETUP STREAM ---
+    def start_vision_stream(self):
+        """Opens a live camera feed for clicking corners."""
+        if self.vis_running: return
+        self.vis_running = True; self.vis_pts = {}; self.last_click = None
+        self.calib_cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
+        cv2.namedWindow("Vision Setup")
+        cv2.setMouseCallback("Vision Setup", self._mouse_cb)
+        self._update_calibration_feed()
+
+    def _mouse_cb(self, event, x, y, flags, param):
+        """Records where the user clicked on the video feed."""
+        if event == cv2.EVENT_LBUTTONDOWN: self.last_click = [x, y]
+
+    def _update_calibration_feed(self):
+        """Updates the setup window with markers showing where you clicked."""
+        if not self.vis_running: 
+            if hasattr(self, 'calib_cap'): self.calib_cap.release()
+            cv2.destroyWindow("Vision Setup")
+            return
+        ret, frame = self.calib_cap.read()
+        if ret:
+            # Draw crosshair where user just clicked
+            if self.last_click: 
+                cv2.drawMarker(frame, (self.last_click[0], self.last_click[1]), (0, 255, 255), cv2.MARKER_CROSS, 20, 2)
+            # Draw saved points
+            for label, pt in self.vis_pts.items():
+                x, y = int(pt[0]), int(pt[1])
+                cv2.circle(frame, (x, y), 8, (0, 255, 0), -1) 
+                # Shadow for readability
+                cv2.putText(frame, label.upper(), (x+12, y-12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4) 
+                cv2.putText(frame, label.upper(), (x+12, y-12), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2) 
+            cv2.imshow("Vision Setup", frame)
+            cv2.waitKey(1)
+        self.root.after(10, self._update_calibration_feed)
+
+    def assign_vis_pt(self, sq):
+        """Maps the last click to a specific board corner (e.g., 'This click was A1')."""
+        if self.last_click: 
+            self.vis_pts[sq] = self.last_click
+            self.log(f"Saved Vision Point: {sq.upper()}")
+        else:
+            self.log("Click on camera feed first!")
+
+    def stop_vision_stream(self):
+        self.vis_running = False
+        self.root.after(100, self._finalize_vision_save)
+
+    def _finalize_vision_save(self):
+        """Calculates the perspective transform and saves to JSON."""
+        try:
+            self.v_zones = interpolate_grid(self.vis_pts['a8'], self.vis_pts['h8'], self.vis_pts['h1'], self.vis_pts['a1'])
+            fn = "vision_white.json" if self.calib_side_var.get() else "vision_black.json"
+            with open(fn, 'w') as f: json.dump(self.v_zones, f)
+            # Backup for debugging
+            with open("vision_grid.json", 'w') as f: json.dump(self.v_zones, f)
+            self.log(f"Vision Saved to {fn}")
+        except: 
+            self.log("Vision Error: Missing Points?")
+            messagebox.showerror("Error", "Please click all 4 corner buttons (A8, H8, A1, H1) before saving.")
+
+    # --- GAME LAUNCHER ---
+    def start_game_thread(self):
+        """Starts the autonomous loop in a separate thread to keep UI active."""
+        if hasattr(self, 'game_thread') and self.game_thread.is_alive(): return self.log("Game Running!")
+        self.stop_requested = False
+        self.game_thread = threading.Thread(target=run_vision_game, args=(self.robot, self.robot_color_var.get(), self))
+        self.game_thread.start()
+
+    def run_sim(self): threading.Thread(target=self._sim).start()
+    
+    # --- SIMULATOR: NOW JUST CALLS THE SHARED BRAIN ---
+    def _sim(self):
+        """Runs a fake move sequence (no vision, just motion) for testing."""
+        m = self.ent_mv.get().strip().lower(); cap = (self.chk_cap.get() == 1)
+        
+        # Instantiate the exact same brain as the game
+        motion = RobotMotion(self.robot, self.mapper, lambda: False) # False means "No stop requested" for sim
+        
+        if len(m) < 4: return
+        sq_src, sq_dst = m[0:2], m[2:4]
+        
+        if cap: motion.execute_capture(sq_src, sq_dst)
+        else:   motion.execute_move(sq_src, sq_dst)
+        
+        self.robot.home()
+
+if __name__ == "__main__":
+    root = tk.Tk(); app = RobotGUI(root)
+    # Ensure robot stops if window is closed violently
+    def on_closing(): root.destroy(); os._exit(0)
+    root.protocol("WM_DELETE_WINDOW", on_closing); root.mainloop()

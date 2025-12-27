@@ -1,0 +1,66 @@
+# ==================================================================================
+# SECTION 1: CONFIGURATION
+# ==================================================================================
+# This section defines the global constants that calibrate the software to your 
+# specific hardware. These values control the physics, safety, and logic of the robot.
+
+# Path to the Stockfish Chess Engine executable.
+# This is the "Brain" that calculates the best moves. 
+# Ensure this path matches the location of the .exe file on your computer.
+STOCKFISH_PATH = r"stockfish/stockfish-windows-x86-64-avx2.exe"
+
+# The USB ID of the webcam used for Computer Vision.
+# 0 usually refers to the default integrated webcam or the first USB camera plugged in.
+# If using multiple cameras, this might need to be changed to 1 or 2.
+CAMERA_INDEX = 0                      
+
+# --- ROBOT DIMENSIONS (cm) ---
+# These are the physical lengths of the robot's links, essential for Inverse Kinematics (IK).
+# If these are incorrect, the robot will not reach the correct X/Y coordinates.
+L_BASE_H = 7.0      # Height from the table surface to the first joint (Shoulder axis).
+L_SHOULDER = 18.0   # Length of the shoulder arm (humeral link).
+L_ELBOW = 20.0      # Length of the elbow arm (forearm link).
+L_WRIST = 17.0      # Length from the wrist joint down to the tip of the gripper.
+
+# --- OFFSETS ---
+# Calibration values to align "Mathematical 0" with "Servo 0".
+# Servos rarely install perfectly at 0 degrees. These values are added/subtracted 
+# from the calculated angles to ensure the physical robot aligns with the software model.
+OFFSET_BASE = 16.0      # Degrees to correct the Base rotation alignment.
+OFFSET_SHOULDER = 4.0   # Degrees to correct the Shoulder elevation.
+OFFSET_ELBOW = 0.0      # Degrees to correct the Elbow bend.
+OFFSET_WRIST = 0.0      # Degrees to correct the Wrist pitch.
+
+# --- HEIGHT STRATEGY ---
+# Z-Coordinates (in cm) relative to the board surface (Z=0).
+Z_TRAVEL = 8.0   # Safe cruising height. The robot moves at this height to clear tall pieces (King/Queen).
+Z_GRIP = 2       # The precise height to grab a piece. Too high = miss; Too low = crash into board.
+Z_HOVER = 13.0   # The "Square Wave" height. Used for lifting straight up before moving horizontally.
+                 # This prevents the diagonal "drag" effect.
+
+# --- GRIPPER ---
+# Servo angles for the claw mechanism.
+GRIP_OPEN_ANGLE = 30    # Angle where the claw is wide enough to fit over a piece.
+GRIP_CLOSED_ANGLE = 145 # Angle where the claw is fully shut (holding the piece tight).
+
+# --- TILT CORRECTION ---
+# Coefficients for the Wrist Pitch Compensation formula.
+# Because the arm links rotate, the wrist naturally tilts. These values are used
+# in a formula (likely a curve) to keep the gripper pointing 90 degrees DOWN 
+# regardless of how far out the arm is extended.
+TILT_CURVE = 0.0035     # Quadratic factor: Corrects tilt based on distance squared.
+TILT_SLOPE = 0.17       # Linear factor: Corrects tilt based on direct distance.
+TILT_INTERCEPT = -5     # Constant offset: Base correction applied at all times.
+MAX_TILT_DROP = -10.0   # Safety cap: Prevents the wrist from compensating too far down.
+
+# --- SAFETY LIMITS ---
+# Hard constraints to prevent the robot from breaking itself.
+# If the math calculates an angle outside these ranges, the robot should refuse to move.
+SHLD_MIN = 0; SHLD_MAX = 175   # Shoulder range (0 to 175 degrees).
+ELBW_MIN = 0; ELBW_MAX = 180   # Elbow range (Full extension to full fold).
+WRST_MIN = 0; WRST_MAX = 180   # Wrist range.
+
+# A specific safety buffer for the shoulder. 
+# Prevents the arm from folding in too close to the base, which could cause the 
+# elbow servo to crash into the base housing or electronics.
+MIN_SAFE_SHOULDER_ANGLE = 55.0

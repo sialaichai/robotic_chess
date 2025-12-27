@@ -15,7 +15,7 @@ const float HOME_BASE     = 1550;
 const float HOME_SHOULDER = 1400;
 const float HOME_ELBOW    = 2400;
 const float HOME_WRIST    = 600; 
-const float HOME_GRIPPER  = 400; 
+const float HOME_GRIPPER  = 780; // 400 = open to 650
 
 // PARKING Position (Calculated from your degrees)
 // Base 90° -> 1400
